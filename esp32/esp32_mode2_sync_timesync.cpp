@@ -59,6 +59,18 @@ constexpr std::int64_t kMinimumTimePlanMarginUs = 100000;
 constexpr std::int64_t kNanoPiUartApplyCompensationUs = 4500;
 constexpr double kFramePeriodUs = 1000000.0 / 30.0;
 constexpr std::uint32_t kPulseWidthUs = 100;
+constexpr gpio_num_t kStatusLedGpio = GPIO_NUM_18;
+constexpr rmt_channel_t kStatusLedRmtChannel = RMT_CHANNEL_1;
+constexpr std::uint8_t kStatusLedClockDivider = 8;  // 80 MHz APB -> 0.1 us ticks
+constexpr std::uint32_t kStatusLedBlinkHalfPeriodMs = 400;
+
+enum class StatusLedEffect : std::uint8_t {
+    boot_dim_red = 0,
+    blue_solid = 1,
+    yellow_solid = 2,
+    green_blink = 3,
+    red_blink = 4,
+};
 
 enum class MessageType : std::uint8_t {
     ping = 1,
@@ -179,6 +191,79 @@ std::uint32_t parseSession(const String& line, std::uint32_t fallback)
     return value == 0 ? fallback : static_cast<std::uint32_t>(value);
 }
 
+bool gStatusLedReady = false;
+StatusLedEffect gLastStatusLedEffect = StatusLedEffect::boot_dim_red;
+bool gLastStatusLedOn = true;
+
+void writeStatusLed(std::uint8_t red, std::uint8_t green, std::uint8_t blue)
+{
+    if (!gStatusLedReady)
+        return;
+
+    std::array<rmt_item32_t, 25> items{};
+    const std::uint32_t grb =
+        (static_cast<std::uint32_t>(green) << 16) |
+        (static_cast<std::uint32_t>(red) << 8) |
+        static_cast<std::uint32_t>(blue);
+    for (std::size_t i = 0; i < 24; ++i) {
+        const bool one = (grb & (UINT32_C(1) << (23 - i))) != 0;
+        items[i].level0 = 1;
+        items[i].duration0 = one ? 8 : 4;
+        items[i].level1 = 0;
+        items[i].duration1 = one ? 5 : 9;
+    }
+    items[24].level0 = 0;
+    items[24].duration0 = 600;
+    items[24].level1 = 0;
+    items[24].duration1 = 1;
+    rmt_write_items(kStatusLedRmtChannel, items.data(),
+                    static_cast<int>(items.size()), true);
+}
+
+void initializeStatusLed()
+{
+    rmt_config_t config =
+        RMT_DEFAULT_CONFIG_TX(kStatusLedGpio, kStatusLedRmtChannel);
+    config.clk_div = kStatusLedClockDivider;
+    config.mem_block_num = 1;
+    config.tx_config.loop_en = false;
+    config.tx_config.carrier_en = false;
+    config.tx_config.idle_output_en = true;
+    config.tx_config.idle_level = RMT_IDLE_LEVEL_LOW;
+    if (rmt_config(&config) != ESP_OK ||
+        rmt_driver_install(kStatusLedRmtChannel, 0, 0) != ESP_OK) {
+        return;
+    }
+    gStatusLedReady = true;
+    writeStatusLed(8, 0, 0);
+}
+
+void serviceStatusLed(StatusLedEffect effect)
+{
+    const bool blinking = effect == StatusLedEffect::green_blink ||
+                          effect == StatusLedEffect::red_blink;
+    const bool led_on = !blinking ||
+        ((millis() / kStatusLedBlinkHalfPeriodMs) & 1U) == 0;
+    if (effect == gLastStatusLedEffect && led_on == gLastStatusLedOn)
+        return;
+
+    gLastStatusLedEffect = effect;
+    gLastStatusLedOn = led_on;
+    if (!led_on) {
+        writeStatusLed(0, 0, 0);
+    } else if (effect == StatusLedEffect::boot_dim_red) {
+        writeStatusLed(8, 0, 0);
+    } else if (effect == StatusLedEffect::blue_solid) {
+        writeStatusLed(0, 0, 48);
+    } else if (effect == StatusLedEffect::yellow_solid) {
+        writeStatusLed(48, 24, 0);
+    } else if (effect == StatusLedEffect::green_blink) {
+        writeStatusLed(0, 64, 0);
+    } else {
+        writeStatusLed(128, 0, 0);
+    }
+}
+
 }  // namespace
 
 #if defined(MODE2_ROLE_WEARABLE)
@@ -240,6 +325,9 @@ std::atomic<std::uint32_t> gSessionId{0};
 std::atomic<std::uint64_t> gGeneratedPulses{0};
 std::atomic<std::uint32_t> gTimeSyncCount{0};
 std::atomic<std::uint32_t> gTimeSyncDrops{0};
+std::atomic<bool> gLedEverConnected{false};
+std::atomic<bool> gLedTimeReady{false};
+std::atomic<bool> gLedCollecting{false};
 
 portMUX_TYPE gPlanMux = portMUX_INITIALIZER_UNLOCKED;
 TriggerPlan gPlan;
@@ -364,6 +452,7 @@ void neoUartWriterTask(void*)
         }
         if (message.kind == NeoTxKind::time_sync) {
             gTimeSyncCount.fetch_add(1);
+            gLedTimeReady.store(true);
             Serial.printf("[TIME] seq=%lu queued to NanoPi UART\n",
                           static_cast<unsigned long>(message.sequence));
         }
@@ -549,6 +638,7 @@ void triggerTask(void*)
             }
             gRunStartUs = plan.local_epoch_us;
             gGeneratedPulses.store(0);
+            gLedCollecting.store(true);
             gNodeState.store(NodeState::running);
             sendStatus();
         }
@@ -562,6 +652,7 @@ void triggerTask(void*)
                 continue;
 
             stopRmtNow();
+            gLedCollecting.store(false);
             const TriggerPlan plan = copyPlan();
             if (gRunStartUs > 0 && stop_epoch > gRunStartUs) {
                 const double period =
@@ -587,11 +678,13 @@ public:
     void onConnect(BLEServer*) override
     {
         gBleConnected.store(true);
+        gLedEverConnected.store(true);
     }
 
     void onDisconnect(BLEServer*) override
     {
         gBleConnected.store(false);
+        gLedTimeReady.store(false);
         BLEDevice::startAdvertising();
     }
 };
@@ -765,6 +858,7 @@ void processNodeCommand(const WireMessage& message)
 
     if (type == MessageType::abort_session) {
         stopRmtNow();
+        gLedCollecting.store(false);
         const std::uint32_t session = gSessionId.load();
         if (session != 0 && !enqueueNeoControl("STOP", session)) {
             gNodeState.store(NodeState::fault);
@@ -850,6 +944,37 @@ void printNodeStatus()
                   static_cast<unsigned long>(gTimeSyncDrops.load()));
 }
 
+StatusLedEffect wearableStatusLedEffect()
+{
+    const NodeState state = gNodeState.load();
+    const bool connected = gBleConnected.load();
+    const bool abnormal = gErrorFlags.load() != error_none ||
+                          state == NodeState::fault || !connected;
+    if (gLedCollecting.load()) {
+        return abnormal ? StatusLedEffect::red_blink
+                        : StatusLedEffect::green_blink;
+    }
+    if ((gLedEverConnected.load() && !connected) ||
+        gErrorFlags.load() != error_none || state == NodeState::fault) {
+        return StatusLedEffect::yellow_solid;
+    }
+    if (connected && gLedTimeReady.load() &&
+        (state == NodeState::idle ||
+         state == NodeState::waiting_neo_start ||
+         state == NodeState::ready || state == NodeState::armed)) {
+        return StatusLedEffect::blue_solid;
+    }
+    return StatusLedEffect::boot_dim_red;
+}
+
+void wearableStatusLedTask(void*)
+{
+    for (;;) {
+        serviceStatusLed(wearableStatusLedEffect());
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 }  // namespace
 
 void setup()
@@ -857,6 +982,9 @@ void setup()
     Serial.begin(115200);
     delay(300);
     Serial1.begin(kNeoBaud, SERIAL_8N1, kNeoRxPin, kNeoTxPin);
+    initializeStatusLed();
+    xTaskCreatePinnedToCore(wearableStatusLedTask, "status_led", 2048,
+                            nullptr, 2, nullptr, 0);
 
     gBleTxMutex = xSemaphoreCreateMutex();
     gCommandQueue = xQueueCreate(12, sizeof(WireMessage));
@@ -962,6 +1090,12 @@ struct PendingTimeDistribution {
     std::size_t sent_links = 0;
 };
 
+struct DiscoveredNode {
+    std::uint8_t node_id = 0;
+    esp_ble_addr_type_t address_type = BLE_ADDR_TYPE_PUBLIC;
+    char address[18]{};
+};
+
 std::array<LinkState, kNodeCount> makeLinks()
 {
     std::array<LinkState, kNodeCount> links{};
@@ -983,6 +1117,11 @@ std::int64_t gPendingCoordinatorEpochUs = 0;
 UtcClockMap gUtcClockMap;
 PendingTimeDistribution gPendingTimeDistribution;
 std::uint32_t gFallbackTimeSequence = 0;
+std::atomic<bool> gLedSessionActive{false};
+std::atomic<std::uint8_t> gLedParticipantMask{0};
+QueueHandle_t gDiscoveredNodeQueue = nullptr;
+std::atomic<bool> gScanInProgress{false};
+std::atomic<std::uint32_t> gPendingDiscoveredNodes{0};
 
 LinkState* linkForNode(std::uint8_t node_id)
 {
@@ -1121,8 +1260,89 @@ bool connectLink(LinkState& link)
     return true;
 }
 
+void coordinatorScanComplete(BLEScanResults results)
+{
+    std::array<DiscoveredNode, kNodeCount> discovered{};
+    std::array<bool, kNodeCount> found{};
+
+    for (int i = 0; i < results.getCount(); ++i) {
+        BLEAdvertisedDevice device = results.getDevice(i);
+        if (!device.isAdvertisingService(BLEUUID(kServiceUuid)) ||
+            !device.haveManufacturerData()) {
+            continue;
+        }
+        const std::string manufacturer = device.getManufacturerData();
+        if (manufacturer.size() < 2 ||
+            static_cast<std::uint8_t>(manufacturer[0]) != 0xD2) {
+            continue;
+        }
+        const std::uint8_t node_id =
+            static_cast<std::uint8_t>(manufacturer[1]);
+        if (node_id < 1 || node_id > kNodeCount)
+            continue;
+
+        DiscoveredNode& candidate = discovered[node_id - 1];
+        candidate.node_id = node_id;
+        candidate.address_type = device.getAddressType();
+        const std::string address = device.getAddress().toString();
+        std::snprintf(candidate.address, sizeof(candidate.address), "%s",
+                      address.c_str());
+        found[node_id - 1] = true;
+    }
+
+    std::uint32_t pending = 0;
+    for (std::size_t i = 0; i < found.size(); ++i) {
+        if (found[i])
+            ++pending;
+    }
+    Serial.printf("SCAN complete: found %u wearable node(s)\n",
+                  static_cast<unsigned>(pending));
+    gPendingDiscoveredNodes.store(pending);
+    for (std::size_t i = 0; i < found.size(); ++i) {
+        if (!found[i])
+            continue;
+        if (gDiscoveredNodeQueue == nullptr ||
+            xQueueSend(gDiscoveredNodeQueue, &discovered[i], 0) != pdTRUE) {
+            gPendingDiscoveredNodes.fetch_sub(1);
+        }
+    }
+
+    BLEDevice::getScan()->clearResults();
+    gScanInProgress.store(false);
+}
+
+void coordinatorConnectionTask(void*)
+{
+    DiscoveredNode discovered{};
+    for (;;) {
+        if (xQueueReceive(gDiscoveredNodeQueue, &discovered,
+                          portMAX_DELAY) != pdTRUE) {
+            continue;
+        }
+        while (gScanInProgress.load())
+            vTaskDelay(pdMS_TO_TICKS(10));
+
+        LinkState* link = linkForNode(discovered.node_id);
+        if (link != nullptr && !link->connected) {
+            link->address = discovered.address;
+            link->address_type = discovered.address_type;
+            connectLink(*link);
+        }
+        gPendingDiscoveredNodes.fetch_sub(1);
+    }
+}
+
 void discoverAndConnectNodes()
 {
+    if (gDiscoveredNodeQueue == nullptr) {
+        Serial.println("SCAN rejected: discovery queue is unavailable");
+        return;
+    }
+    if (gScanInProgress.load() || gPendingDiscoveredNodes.load() != 0) {
+        Serial.println("SCAN ignored: scan or connection is already in progress");
+        return;
+    }
+
     bool need_scan = false;
     for (const auto& link : gLinks) {
         if (!link.connected) {
@@ -1130,36 +1350,20 @@ void discoverAndConnectNodes()
             break;
         }
     }
-    if (!need_scan)
+    if (!need_scan) {
+        Serial.println("SCAN skipped: all wearable nodes are already connected");
         return;
+    }
 
     BLEScan* scan = BLEDevice::getScan();
     scan->setActiveScan(true);
     scan->setInterval(160);
     scan->setWindow(80);
-    BLEScanResults results = scan->start(4, false);
-
-    for (int i = 0; i < results.getCount(); ++i) {
-        BLEAdvertisedDevice device = results.getDevice(i);
-        if (!device.isAdvertisingService(BLEUUID(kServiceUuid)) ||
-            !device.haveManufacturerData())
-            continue;
-        const std::string manufacturer = device.getManufacturerData();
-        if (manufacturer.size() < 2 ||
-            static_cast<std::uint8_t>(manufacturer[0]) != 0xD2)
-            continue;
-        const std::uint8_t node_id = static_cast<std::uint8_t>(manufacturer[1]);
-        LinkState* link = linkForNode(node_id);
-        if (link == nullptr || link->connected)
-            continue;
-        link->address = device.getAddress().toString();
-        link->address_type = device.getAddressType();
-    }
-    scan->clearResults();
-
-    for (auto& link : gLinks) {
-        if (!link.connected && !link.address.empty())
-            connectLink(link);
+    gScanInProgress.store(true);
+    Serial.println("SCAN started: searching for wearable nodes for 4 seconds");
+    if (!scan->start(4, coordinatorScanComplete, false)) {
+        gScanInProgress.store(false);
+        Serial.println("SCAN failed: BLE scanner did not start");
     }
 }
 
@@ -1191,6 +1395,62 @@ bool linkSynchronized(const LinkState& link, std::int64_t now_us)
            now_us - link.ref_coordinator_us < 2500000;
 }
 
+StatusLedEffect coordinatorStatusLedEffect()
+{
+    const std::int64_t now_us = esp_timer_get_time();
+    const bool session_active = gLedSessionActive.load();
+    const std::uint8_t participant_mask = gLedParticipantMask.load();
+    bool any_connected = false;
+    bool all_allowed = true;
+    bool session_error = session_active && participant_mask == 0;
+    bool all_running = session_active && participant_mask != 0;
+
+    portENTER_CRITICAL(&gLinksMux);
+    for (std::size_t i = 0; i < gLinks.size(); ++i) {
+        const LinkState& link = gLinks[i];
+        const bool participant =
+            (participant_mask & (UINT8_C(1) << i)) != 0;
+        if (session_active && participant) {
+            const bool status_fresh = link.last_status_us > 0 &&
+                now_us - link.last_status_us < 2000000;
+            if (!link.connected || !status_fresh ||
+                link.node_errors != error_none ||
+                link.node_state == NodeState::fault) {
+                session_error = true;
+            }
+            if (!link.connected || link.node_state != NodeState::running)
+                all_running = false;
+        }
+        if (!link.connected)
+            continue;
+        any_connected = true;
+        if (!linkSynchronized(link, now_us) ||
+            link.node_errors != error_none ||
+            link.node_state != NodeState::idle) {
+            all_allowed = false;
+        }
+    }
+    portEXIT_CRITICAL(&gLinksMux);
+
+    if (session_active) {
+        if (session_error)
+            return StatusLedEffect::red_blink;
+        return all_running ? StatusLedEffect::green_blink
+                           : StatusLedEffect::blue_solid;
+    }
+    return any_connected && all_allowed
+        ? StatusLedEffect::blue_solid
+        : StatusLedEffect::boot_dim_red;
+}
+
+void coordinatorStatusLedTask(void*)
+{
+    for (;;) {
+        serviceStatusLed(coordinatorStatusLedEffect());
+        vTaskDelay(pdMS_TO_TICKS(50));
+    }
+}
+
 std::int64_t coordinatorToLocal(const LinkState& link,
                                  std::int64_t coordinator_us)
 {
@@ -1208,11 +1468,15 @@ bool validUtcNs(std::int64_t utc_ns)
 
 bool allLinksTimeReady(std::int64_t now_us)
 {
+    bool any_connected = false;
     for (const auto& link : gLinks) {
+        if (!link.connected)
+            continue;
+        any_connected = true;
         if (!linkSynchronized(link, now_us))
             return false;
     }
-    return true;
+    return any_connected;
 }
 
 bool scheduleTimeDistribution(const UtcClockMap& map)
@@ -1280,6 +1544,13 @@ void servicePendingTimeDistribution()
         gPendingTimeDistribution.active = false;
         return;
     }
+
+    while (gPendingTimeDistribution.next_link < gLinks.size() &&
+           !gLinks[gPendingTimeDistribution.next_link].connected) {
+        ++gPendingTimeDistribution.next_link;
+    }
+    if (gPendingTimeDistribution.next_link >= gLinks.size())
+        return;
 
     LinkState& link = gLinks[gPendingTimeDistribution.next_link];
     if (!linkSynchronized(link, now_us)) {
@@ -1369,7 +1640,13 @@ bool parsePreciseTimeSetCommand(const String& command,
 bool beginSession(std::uint32_t session_id)
 {
     const std::int64_t now_us = esp_timer_get_time();
+    std::size_t connected_nodes = 0;
+    std::uint8_t participant_mask = 0;
     for (const auto& link : gLinks) {
+        if (!link.connected)
+            continue;
+        ++connected_nodes;
+        participant_mask |= UINT8_C(1) << (link.node_id - 1);
         if (!linkSynchronized(link, now_us) ||
             (link.node_state != NodeState::idle &&
              link.node_state != NodeState::fault)) {
@@ -1381,9 +1658,15 @@ bool beginSession(std::uint32_t session_id)
             return false;
         }
     }
+    if (connected_nodes == 0) {
+        Serial.println("START rejected: no wearable connected");
+        return false;
+    }
 
     const std::int64_t epoch_us = now_us + kPlanLeadUs;
     for (auto& link : gLinks) {
+        if (!link.connected)
+            continue;
         WireMessage plan{};
         plan.type = static_cast<std::uint8_t>(MessageType::plan);
         plan.sequence = ++gSequence;
@@ -1400,10 +1683,12 @@ bool beginSession(std::uint32_t session_id)
     gArmSent = false;
     gPendingSession = session_id;
     gPendingCoordinatorEpochUs = epoch_us;
+    gLedParticipantMask.store(participant_mask);
+    gLedSessionActive.store(true);
     Serial.printf("session %lu planned; common epoch=%lldus, waiting for %u Neo ACK(s)\n",
                   static_cast<unsigned long>(session_id),
                   static_cast<long long>(epoch_us),
-                  static_cast<unsigned>(kNodeCount));
+                  static_cast<unsigned>(connected_nodes));
     return true;
 }
 
@@ -1414,14 +1699,20 @@ void servicePendingStart()
 
     bool all_ready = true;
     bool any_fault = false;
+    bool any_connected = false;
     for (const auto& link : gLinks) {
+        if (!link.connected)
+            continue;
+        any_connected = true;
         if (link.node_state == NodeState::fault)
             any_fault = true;
-        if (!link.connected || link.node_session != gPendingSession ||
+        if (link.node_session != gPendingSession ||
             link.node_state != NodeState::ready) {
             all_ready = false;
         }
     }
+    if (!any_connected)
+        all_ready = false;
 
     const std::int64_t now_us = esp_timer_get_time();
     if (!all_ready && (any_fault ||
@@ -1437,6 +1728,8 @@ void servicePendingStart()
             sendMessage(link, abort, true);
         }
         gStartPending = false;
+        gLedSessionActive.store(false);
+        gLedParticipantMask.store(0);
         return;
     }
 
@@ -1444,6 +1737,8 @@ void servicePendingStart()
         return;
 
     for (auto& link : gLinks) {
+        if (!link.connected)
+            continue;
         WireMessage arm{};
         arm.type = static_cast<std::uint8_t>(MessageType::arm);
         arm.sequence = ++gSequence;
@@ -1451,7 +1746,7 @@ void servicePendingStart()
         sendMessage(link, arm, true);
     }
     gArmSent = true;
-    Serial.printf("session %lu ARMED on all nodes\n",
+    Serial.printf("session %lu ARMED on connected nodes\n",
                   static_cast<unsigned long>(gPendingSession));
 }
 
@@ -1476,6 +1771,8 @@ void stopSession()
                   static_cast<long long>(coordinator_stop_us));
     gStartPending = false;
     gArmSent = false;
+    gLedSessionActive.store(false);
+    gLedParticipantMask.store(0);
 }
 
 void abortSession()
@@ -1492,6 +1789,8 @@ void abortSession()
     gStartPending = false;
     gArmSent = false;
     gPendingSession = 0;
+    gLedSessionActive.store(false);
+    gLedParticipantMask.store(0);
     Serial.println("ABORT sent to all nodes");
 }
 
@@ -1553,6 +1852,8 @@ void processCoordinatorCommand(const String& command)
             return;
         }
         scheduleTimeDistribution(map);
+    } else if (command.equalsIgnoreCase("SCAN")) {
+        discoverAndConnectNodes();
     } else if (command.startsWith("START")) {
         const std::uint32_t fallback =
             static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
@@ -1565,7 +1866,7 @@ void processCoordinatorCommand(const String& command)
         printCoordinatorStatus();
     } else if (command.length() > 0) {
         Serial.println(
-            "commands: START <session>, STOP, ABORT, STATUS, "
+            "commands: SCAN, START <session>, STOP, ABORT, STATUS, "
             "TIME <unix_sec> <usec>, TIME_QUERY <seq>, "
             "TIME_SET <seq> <coordinator_ref_us> <utc_ref_ns> <uncertainty_us>");
     }
@@ -1577,24 +1878,28 @@ void setup()
 {
     Serial.begin(115200);
     delay(300);
+    initializeStatusLed();
+    xTaskCreatePinnedToCore(coordinatorStatusLedTask, "status_led", 2048,
+                            nullptr, 2, nullptr, 0);
     BLEDevice::init("Mode2Coordinator");
     BLEDevice::setMTU(185);
     BLEDevice::setPower(ESP_PWR_LVL_P9);
-    Serial.printf("Mode2+Time coordinator ready; discovering nodes 1..%u\n",
+    gDiscoveredNodeQueue = xQueueCreate(kNodeCount, sizeof(DiscoveredNode));
+    if (gDiscoveredNodeQueue != nullptr) {
+        xTaskCreatePinnedToCore(coordinatorConnectionTask, "ble_connect", 4096,
+                                nullptr, 2, nullptr, 1);
+    } else {
+        Serial.println("FATAL: BLE discovery queue initialization failed");
+    }
+    Serial.printf("Mode2+Time coordinator ready; SCAN discovers nodes 1..%u on demand\n",
                   static_cast<unsigned>(kNodeCount));
     Serial.println(
-        "commands: START <session>, STOP, ABORT, STATUS, "
+        "commands: SCAN, START <session>, STOP, ABORT, STATUS, "
         "TIME <unix_sec> <usec>, TIME_QUERY <seq>, TIME_SET ...");
 }
 
 void loop()
 {
-    static std::uint32_t last_discovery_ms = 0;
-    if (millis() - last_discovery_ms >= 5000) {
-        last_discovery_ms = millis();
-        discoverAndConnectNodes();
-    }
-
     sendNextPing();
     servicePendingStart();
     processCoordinatorCommand(readUsbLine());
