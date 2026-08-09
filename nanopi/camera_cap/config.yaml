@@ -1,0 +1,49 @@
+device:
+  # Leave empty only when exactly one RealSense is attached to this board.
+  serial: ""
+  # Use head_cam, left_wrist_cam, or right_wrist_cam on the corresponding board.
+  camera_name: "head_cam"
+
+streams:
+  width: 1280
+  height: 720
+  fps: 30
+  # D435i enumerates native packed YUYV; RK3528A MPP encodes it to MJPEG.
+  color_format: "yuyv"
+  depth_format: "z16"
+  max_mjpeg_bytes: 2097152
+  jpeg_quality: 80
+
+sync:
+  # All three wearable cameras are external-trigger slaves.
+  inter_cam_sync_mode: 2
+
+camera_controls:
+  disable_auto_exposure: true
+  color_exposure: 150
+  depth_exposure: 8000
+  color_gain: 16
+  depth_gain: 16
+  disable_auto_exposure_priority: true
+  global_time_enabled: false
+
+storage:
+  base_dir: "/home/pi/data_mode2"
+  # Keep the Depth stream active for Mode 2 synchronization; false only skips
+  # creating and writing depth_*.z16 files.
+  write_depth: true
+  queue_capacity: 24
+  chunk_frames: 300
+  fdatasync_on_chunk_close: true
+  drain_timeout_ms: 15000
+
+cpu_affinity:
+  # CPU 0 is normally left to Linux/USB IRQs. -1 disables affinity.
+  capture_core: 1
+  encoder_core: -1
+  writer_core: -1
+
+control:
+  # shared_memory: use the existing UART receiver and START/STOP protocol.
+  # immediate: start session 1 as soon as the camera pipeline is ready.
+  mode: "shared_memory"

@@ -1,0 +1,25 @@
+# Build outputs
+build/
+**/build/
+.pio/
+**/.pio/
+
+# Runtime logs and captured data
+logs/
+**/logs/
+data_mode2/
+**/data_mode2/
+*.mjpg
+*.z16
+index_*.bin
+
+# Python
+__pycache__/
+*.py[cod]
+.venv/
+
+# Editors / OS
+.vscode/
+.idea/
+.DS_Store
+Thumbs.db
