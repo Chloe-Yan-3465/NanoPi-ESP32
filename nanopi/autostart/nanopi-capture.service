@@ -1,0 +1,27 @@
+[Unit]
+Description=NanoPi Mode2 camera and UART acquisition
+Wants=dev-ttyS1.device
+After=local-fs.target dev-ttyS1.device
+StartLimitIntervalSec=0
+
+[Service]
+Type=simple
+User=pi
+Group=pi
+WorkingDirectory=/home/pi
+Environment=HOME=/home/pi
+Environment=TIME_SET_MODE=idle
+ExecStart=/home/pi/start_tmux_autostart.sh
+SuccessExitStatus=143
+Restart=on-failure
+RestartSec=15
+TimeoutStopSec=10
+KillMode=control-group
+CapabilityBoundingSet=CAP_SYS_TIME CAP_SYS_NICE
+AmbientCapabilities=CAP_SYS_TIME CAP_SYS_NICE
+NoNewPrivileges=true
+StandardOutput=journal
+StandardError=journal
+
+[Install]
+WantedBy=multi-user.target
