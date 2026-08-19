@@ -217,8 +217,9 @@ AppConfig load_config(const std::string& path)
         throw std::runtime_error(
             "device.camera_name must contain only A-Z, a-z, 0-9, '_' or '-'");
     }
-    if (cfg.sync_mode != 2)
-        throw std::runtime_error("Mode 2 build requires inter_cam_sync_mode=2");
+    if (cfg.sync_mode != 0 && cfg.sync_mode != 2)
+        throw std::runtime_error(
+            "inter_cam_sync_mode must be 0 (free-run) or 2 (external slave)");
     if (cfg.queue_capacity < 2 || cfg.queue_capacity > 120)
         throw std::runtime_error("queue_capacity must be in [2, 120]");
     if (cfg.chunk_frames == 0)
@@ -870,7 +871,9 @@ int run_main(int argc, char** argv)
             static_cast<double>(cfg.max_mjpeg_bytes + depth_bytes) /
             1024.0 / 1024.0;
 
-        std::cout << "[CONFIG] Mode 2 external slave, "
+        std::cout << "[CONFIG] Mode " << cfg.sync_mode << ' '
+                  << (cfg.sync_mode == 0 ? "free-run" : "external slave")
+                  << ", "
                   << cfg.width << 'x' << cfg.height << '@' << cfg.fps
                   << " RGB=YUYV->MPP-MJPEG(q=" << cfg.jpeg_quality
                   << ") Depth=Z16\n"
@@ -1310,7 +1313,7 @@ private:
              << "session_id: " << session_id << "\n"
              << "camera_serial: \"" << serial << "\"\n"
              << "camera_name: \"" << cfg_.camera_name << "\"\n"
-             << "inter_cam_sync_mode: 2\n"
+             << "inter_cam_sync_mode: " << cfg_.sync_mode << "\n"
              << "width: " << cfg_.width << "\n"
              << "height: " << cfg_.height << "\n"
              << "fps: " << cfg_.fps << "\n"
@@ -1846,9 +1849,14 @@ float configure_device(rs2::device& device, const AppConfig& cfg)
             }
             sensor.set_option(RS2_OPTION_INTER_CAM_SYNC_MODE,
                               static_cast<float>(cfg.sync_mode));
+            const float sync_mode_readback =
+                sensor.get_option(RS2_OPTION_INTER_CAM_SYNC_MODE);
             sync_configured = true;
-            std::cout << "[SYNC] Stereo Module set to Mode "
-                      << cfg.sync_mode << " (external slave)\n";
+            std::cout << "[SYNC] Stereo Module requested Mode "
+                      << cfg.sync_mode << ", readback=" << sync_mode_readback
+                      << " ("
+                      << (cfg.sync_mode == 0 ? "free-run" : "external slave")
+                      << ")\n";
         }
 
         if (cfg.disable_auto_exposure)
@@ -1876,7 +1884,8 @@ float configure_device(rs2::device& device, const AppConfig& cfg)
     }
 
     if (!sync_configured)
-        throw std::runtime_error("failed to configure Mode 2 on depth sensor");
+        throw std::runtime_error(
+            "failed to configure inter-camera sync mode on depth sensor");
     return depth_scale;
 }
 
