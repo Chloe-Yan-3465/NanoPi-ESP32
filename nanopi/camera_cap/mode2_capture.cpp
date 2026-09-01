@@ -38,6 +38,7 @@ extern "C"
 #include <unistd.h>
 
 #include "camera_control_shm.h"
+#include "depth_codec.h"
 
 namespace fs = std::filesystem;
 
@@ -64,15 +65,18 @@ std::string local_timestamp()
     std::tm tm_value{};
     localtime_r(&now_time, &tm_value);
 
-    const auto milliseconds = std::chrono::duration_cast<
-        std::chrono::milliseconds>(now.time_since_epoch()).count() % 1000;
     char date_time[32]{};
     std::strftime(date_time, sizeof(date_time), "%Y%m%d_%H%M%S", &tm_value);
+    return date_time;
+}
 
-    char result[40]{};
-    std::snprintf(result, sizeof(result), "%s_%03lld", date_time,
-                  static_cast<long long>(milliseconds));
-    return result;
+bool valid_path_segment(const std::string& value, std::size_t capacity)
+{
+    if (value.empty() || value.size() >= capacity)
+        return false;
+    return value.find_first_not_of(
+        "ABCDEFGHIJKLMNOPQRSTUVWXYZabcdefghijklmnopqrstuvwxyz0123456789_-") ==
+        std::string::npos;
 }
 
 void bind_current_thread(int core, const char* thread_name)
@@ -129,6 +133,7 @@ struct AppConfig
 
     std::string base_dir = "/home/pi/data_mode2";
     bool write_depth = true;
+    std::string depth_codec_name = "rvl_zstd1";
     std::size_t queue_capacity = 24;
     std::uint32_t chunk_frames = 300;
     bool fdatasync_on_chunk_close = true;
@@ -191,6 +196,9 @@ AppConfig load_config(const std::string& path)
     cfg.base_dir = yaml_value<std::string>(
         storage, "base_dir", "/home/pi/data_mode2");
     cfg.write_depth = yaml_value<bool>(storage, "write_depth", true);
+    cfg.depth_codec_name = yaml_value<std::string>(
+        storage, "depth_codec", "rvl_zstd1");
+    depth_codec::lookup(cfg.depth_codec_name);
     cfg.queue_capacity = yaml_value<std::size_t>(
         storage, "queue_capacity", 24);
     cfg.chunk_frames = yaml_value<std::uint32_t>(
@@ -595,6 +603,8 @@ public:
         close();
         chunk_id_ = chunk_id;
         write_depth_ = cfg.write_depth;
+        const depth_codec::Info& codec_info =
+            depth_codec::lookup(cfg.depth_codec_name);
         char id[16]{};
         std::snprintf(id, sizeof(id), "%06u", chunk_id);
 
@@ -604,7 +614,9 @@ public:
             if (write_depth_)
             {
                 depth_fd_ = open_new_file(
-                    directory / (std::string("depth_") + id + ".z16"));
+                    directory /
+                    (std::string("depth_") + id + "." +
+                     codec_info.extension));
             }
             index_fd_ = open_new_file(
                 directory / (std::string("index_") + id + ".bin"));
@@ -627,14 +639,16 @@ public:
         header.session_id = session_id;
         header.rgb_fourcc = fourcc('M', 'J', 'P', 'G');
         header.depth_fourcc = write_depth_
-            ? fourcc('Z', '1', '6', ' ')
+            ? fourcc(codec_info.fourcc[0], codec_info.fourcc[1],
+                     codec_info.fourcc[2], codec_info.fourcc[3])
             : fourcc('N', 'O', 'N', 'E');
         header.depth_scale = depth_scale;
         header.created_unix_ns = unix_now_ns();
         write_all(index_fd_, &header, sizeof(header));
     }
 
-    void append(const FrameBundle& frame)
+    void append(const FrameBundle& frame, const std::uint8_t* depth_data,
+                std::uint32_t depth_data_bytes)
     {
         if (!is_open())
             throw std::runtime_error("append called with no open chunk");
@@ -653,7 +667,7 @@ public:
         record.rgb_offset = rgb_offset_;
         record.depth_offset = depth_offset_;
         record.rgb_bytes = frame.rgb_bytes;
-        record.depth_bytes = write_depth_ ? frame.depth_bytes : 0U;
+        record.depth_bytes = write_depth_ ? depth_data_bytes : 0U;
         if (frame.rgb_sensor_timestamp >= 0)
             record.flags |= 1U;
         if (frame.depth_sensor_timestamp >= 0)
@@ -663,12 +677,12 @@ public:
         // points beyond data that was never submitted to the kernel.
         write_all(rgb_fd_, frame.rgb.data(), frame.rgb_bytes);
         if (write_depth_)
-            write_all(depth_fd_, frame.depth.data(), frame.depth_bytes);
+            write_all(depth_fd_, depth_data, depth_data_bytes);
         write_all(index_fd_, &record, sizeof(record));
 
         rgb_offset_ += frame.rgb_bytes;
         if (write_depth_)
-            depth_offset_ += frame.depth_bytes;
+            depth_offset_ += depth_data_bytes;
         ++record_count_;
     }
 
@@ -860,7 +874,7 @@ int run_main(int argc, char** argv)
         install_signal_handlers();
         const std::string config_path = argc == 2
             ? argv[1]
-            : "/home/pi/camera_cap/config.yaml";
+            : "/home/pi/nanopi/camera_cap/config.yaml";
         AppConfig cfg = load_config(config_path);
 
         const std::size_t depth_bytes =
@@ -876,7 +890,7 @@ int run_main(int argc, char** argv)
                   << ", "
                   << cfg.width << 'x' << cfg.height << '@' << cfg.fps
                   << " RGB=YUYV->MPP-MJPEG(q=" << cfg.jpeg_quality
-                  << ") Depth=Z16\n"
+                  << ") Depth=" << cfg.depth_codec_name << "\n"
                   << "[CONFIG] preallocated bundles=" << cfg.queue_capacity
                   << " estimated_pool=" << std::fixed << std::setprecision(1)
                   << pool_mib << " MiB capture_core=" << cfg.capture_core
@@ -934,7 +948,9 @@ int run_main(int argc, char** argv)
         };
 
         auto start_session = [&](std::uint32_t session,
-                                 std::string& error) -> bool
+                                  const std::string& task_name,
+                                  const std::string& complex_level,
+                                  std::string& error) -> bool
         {
             if (recording.load())
             {
@@ -950,7 +966,8 @@ int run_main(int argc, char** argv)
             pool.clear_queued();
             shared.set_state(CAMERA_STATE_STARTING);
             std::string ep_path;
-            if (!writer.open_session(session, capture.serial(),
+            if (!writer.open_session(session, task_name, complex_level,
+                                     capture.serial(),
                                      capture.depth_scale(), ep_path, error))
             {
                 shared.set_state(CAMERA_STATE_ERROR);
@@ -1001,7 +1018,7 @@ int run_main(int argc, char** argv)
         if (cfg.control_mode == "immediate")
         {
             std::string error;
-            if (!start_session(1, error))
+            if (!start_session(1, "test", "L_test", error))
                 throw std::runtime_error("immediate START failed: " + error);
         }
 
@@ -1052,6 +1069,14 @@ int run_main(int argc, char** argv)
                         camera_shm_load_u32(&shared.get()->command));
                     const std::uint32_t requested_session =
                         camera_shm_load_u32(&shared.get()->session_id);
+                    const std::string requested_task(
+                        shared.get()->task_name,
+                        strnlen(shared.get()->task_name,
+                                sizeof(shared.get()->task_name)));
+                    const std::string requested_level(
+                        shared.get()->complex_level,
+                        strnlen(shared.get()->complex_level,
+                                sizeof(shared.get()->complex_level)));
                     std::string error;
 
                     if (command == CAMERA_COMMAND_START)
@@ -1061,7 +1086,20 @@ int run_main(int argc, char** argv)
                         {
                             shared.respond(request_seq, CAMERA_RESULT_OK, "");
                         }
-                        else if (start_session(requested_session, error))
+                        else if (!valid_path_segment(
+                                     requested_task,
+                                     CAMERA_TASK_NAME_CAPACITY) ||
+                                 !valid_path_segment(
+                                     requested_level,
+                                     CAMERA_COMPLEX_LEVEL_CAPACITY))
+                        {
+                            shared.respond(request_seq,
+                                CAMERA_RESULT_INVALID_COMMAND,
+                                "INVALID_CAPTURE_METADATA");
+                        }
+                        else if (start_session(requested_session,
+                                               requested_task,
+                                               requested_level, error))
                         {
                             shared.respond(request_seq, CAMERA_RESULT_OK, "");
                         }
@@ -1185,6 +1223,13 @@ public:
     ChunkWriter(FramePool& pool, const AppConfig& cfg)
         : pool_(pool), cfg_(cfg)
     {
+        const depth_codec::Info& info =
+            depth_codec::lookup(cfg_.depth_codec_name);
+        const std::size_t pixels =
+            static_cast<std::size_t>(cfg_.width) *
+            static_cast<std::size_t>(cfg_.height);
+        codec_ = std::make_unique<depth_codec::Codec>(info.kind, pixels);
+        encoded_.resize(codec_->output_capacity());
     }
 
     ~ChunkWriter()
@@ -1209,7 +1254,10 @@ public:
             thread_.join();
     }
 
-    bool open_session(std::uint32_t session_id, const std::string& serial,
+    bool open_session(std::uint32_t session_id,
+                      const std::string& task_name,
+                      const std::string& complex_level,
+                      const std::string& serial,
                       float depth_scale, std::string& ep_path,
                       std::string& error)
     {
@@ -1219,14 +1267,23 @@ public:
             if (session_open_)
                 throw std::runtime_error("a session is already open");
 
+            if (!valid_path_segment(task_name, CAMERA_TASK_NAME_CAPACITY) ||
+                !valid_path_segment(complex_level,
+                                    CAMERA_COMPLEX_LEVEL_CAPACITY))
+            {
+                throw std::runtime_error("invalid capture task metadata");
+            }
             const fs::path episode_directory = fs::path(cfg_.base_dir) /
-                ("ep_" + local_timestamp());
+                task_name / complex_level /
+                ("ep_" + local_timestamp() + "_" +
+                 std::to_string(session_id));
             const fs::path directory = episode_directory / cfg_.camera_name;
             if (fs::exists(directory))
                 throw std::runtime_error("camera output directory already exists");
             fs::create_directories(directory);
 
-            write_manifest(directory, session_id, serial, depth_scale);
+            write_manifest(directory, session_id, task_name, complex_level,
+                           serial, depth_scale);
             fs::copy_file(cfg_.config_path, directory / "capture_config.yaml",
                           fs::copy_options::overwrite_existing);
 
@@ -1302,6 +1359,8 @@ public:
 
 private:
     void write_manifest(const fs::path& directory, std::uint32_t session_id,
+                        const std::string& task_name,
+                        const std::string& complex_level,
                         const std::string& serial, float depth_scale)
     {
         std::ofstream file(directory / "manifest.yaml",
@@ -1311,6 +1370,8 @@ private:
 
         file << "format_version: 1\n"
              << "session_id: " << session_id << "\n"
+             << "task_name: \"" << task_name << "\"\n"
+             << "complex_level: \"" << complex_level << "\"\n"
              << "camera_serial: \"" << serial << "\"\n"
              << "camera_name: \"" << cfg_.camera_name << "\"\n"
              << "inter_cam_sync_mode: " << cfg_.sync_mode << "\n"
@@ -1321,7 +1382,7 @@ private:
              << "rgb_format: MJPEG\n"
              << "jpeg_encoder: rockchip_mpp\n"
              << "jpeg_quality: " << cfg_.jpeg_quality << "\n"
-             << "depth_format: Z16_LE\n"
+             << "depth_format: " << cfg_.depth_codec_name << "\n"
              << "depth_written: " << (cfg_.write_depth ? "true" : "false")
              << "\n"
              << std::setprecision(9)
@@ -1374,12 +1435,22 @@ private:
                 if (session_open_)
                 {
                     ensure_chunk();
-                    chunks_.append(*frame);
+                    std::uint32_t encoded_bytes = 0U;
+                    if (cfg_.write_depth && frame->depth_bytes > 0U)
+                    {
+                        encoded_bytes = static_cast<std::uint32_t>(
+                            codec_->encode(
+                                reinterpret_cast<const std::uint16_t*>(
+                                    frame->depth.data()),
+                                encoded_.data()));
+                    }
+                    chunks_.append(*frame, encoded_.data(),
+                                   encoded_bytes);
                     ++frames_in_chunk_;
                     session_written_.fetch_add(1);
                     bytes_written_.fetch_add(
                         static_cast<std::uint64_t>(frame->rgb_bytes) +
-                        (cfg_.write_depth ? frame->depth_bytes : 0U) +
+                        encoded_bytes +
                         sizeof(IndexRecord));
 
                     // write(2) already transfers bytes into the kernel page
@@ -1412,6 +1483,8 @@ private:
     std::uint32_t chunk_id_ = 0;
     std::uint32_t frames_in_chunk_ = 0;
     ChunkFiles chunks_;
+    std::unique_ptr<depth_codec::Codec> codec_;
+    std::vector<std::uint8_t> encoded_;
     std::atomic<std::uint64_t> session_written_{0};
     std::atomic<std::uint64_t> bytes_written_{0};
     std::atomic<std::uint64_t> write_errors_{0};

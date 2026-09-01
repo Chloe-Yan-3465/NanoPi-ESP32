@@ -7,7 +7,9 @@
 // process creates this object; the UART receiver opens it afterwards.
 static constexpr const char* CAMERA_CONTROL_SHM_NAME = "/yuv_ep_flag";
 static constexpr std::uint32_t CAMERA_CONTROL_SHM_MAGIC = 0x43414D35U;
-static constexpr std::uint32_t CAMERA_CONTROL_SHM_VERSION = 1U;
+static constexpr std::uint32_t CAMERA_CONTROL_SHM_VERSION = 2U;
+static constexpr std::size_t CAMERA_TASK_NAME_CAPACITY = 32U;
+static constexpr std::size_t CAMERA_COMPLEX_LEVEL_CAPACITY = 16U;
 
 enum CameraControlCommand : std::uint32_t
 {
@@ -53,6 +55,8 @@ struct CameraControlSharedMemory
 
     char error[128];
     char ep_path[512];
+    char task_name[CAMERA_TASK_NAME_CAPACITY];
+    char complex_level[CAMERA_COMPLEX_LEVEL_CAPACITY];
 };
 
 static inline std::uint32_t camera_shm_load_u32(

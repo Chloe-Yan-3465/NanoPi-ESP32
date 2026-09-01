@@ -1,8 +1,15 @@
 # NanoPi + ESP32 + RealSense Mode 2 同步采集系统
 
-本仓库整理的是 2026-08-08 实测版本，用于三套可穿戴 RGBD 采集设备：头部、左手和右手各由一台 Intel RealSense D435i、一块 NanoPi NEO3 Plus 和一块 wearable ESP32-S3 组成，另有一块 ESP32-S3 作为无线同步中控。
+本仓库当前版本更新于 2026-09-01，用于三套可穿戴 RGBD 采集设备：头部、左手和右手各由一台 Intel RealSense D435i、一块 NanoPi NEO3 Plus 和一块 wearable ESP32-S3 组成，另有一块 ESP32-S3 作为无线同步中控。
 
 仓库只包含 NanoPi 和 ESP32 代码。Windows 端 `BLE-TimeSync` 控制程序独立运行，通过 USB 串口控制中控 ESP32。
+
+## 2026-09-01 更新
+
+- Windows START 命令可携带 `TASK` 与 `LEVEL`，采集数据按任务、难度和 episode 分层保存。
+- wearable ESP32 将任务元数据随 START 转发给 NanoPi；裸 `START` 继续兼容，默认使用 `test/L_test`。
+- Depth 默认采用无损 `RVL + Zstd level 1` 编码并保存为 `.rvz`，降低持续采集的磁盘占用。
+- NanoPi 只保留 `nanopi/autostart/` 一套开机自启动方案，增加 RealSense USB3、帧率和 UART 运行状态检查及故障恢复。
 
 ## 目录
 
@@ -15,10 +22,17 @@
 │   ├── build.sh
 │   ├── start_tmux.sh
 │   ├── stop_tmux.sh
+│   ├── autostart/
+│   │   ├── install_autostart.sh
+│   │   ├── start_tmux_autostart.sh
+│   │   ├── recover_realsense_usb.sh
+│   │   ├── nanopi-capture.service
+│   │   └── deploy_to_nanopi.sh
 │   ├── camera_cap/
 │   │   ├── mode2_capture.cpp
 │   │   ├── uart_camera_receiver.cpp
 │   │   ├── camera_control_shm.h
+│   │   ├── depth_codec.h
 │   │   └── config.yaml
 │   ├── common/
 │   │   └── camera_control_shm.h
@@ -47,7 +61,7 @@
 
 ```text
 Windows BLE-TimeSync
-  │ USB CDC 115200：TIME_QUERY / TIME_SET / START / STOP
+  │ USB CDC 115200：TIME_QUERY / TIME_SET / START TASK=... LEVEL=... / STOP
   ▼
 Coordinator ESP32
   │ BLE：ping/pong 时钟模型、授时计划、录制计划
@@ -100,23 +114,23 @@ Windows 程序直接按 `0`：
 每个相机目录包含：
 
 ```text
-camera_name/
+<task_name>/<complex_level>/ep_YYYYMMDD_HHMMSS_<session_id>/camera_name/
 ├── capture_config.yaml
 ├── manifest.yaml
 ├── rgb_000000.mjpg
-├── depth_000000.z16
+├── depth_000000.rvz
 └── index_000000.bin
 ```
 
 - RGB：D435i YUYV，经 Rockchip MPP 编码为逐帧 MJPEG。
-- Depth：原始小端 Z16，可在配置中关闭写盘，但 Depth stream 仍保持开启以支持 Mode 2。
+- Depth：默认将原始小端 Z16 逐帧进行无损 RVL + Zstd level 1 编码；可通过 `storage.depth_codec` 切换编码，也可关闭写盘，但 Depth stream 仍保持开启以支持 Mode 2。
 - Index：每帧保存 RGB/Depth 帧号、传感器时间、RealSense 时间域、主机接收 UTC、分块文件偏移量和字节数。
 
 `nanopi/tools/parse_mode2_index.py` 可在采集后导出 TXT/CSV/JSONL。时间戳表中的 `source_index + rgb/depth_offset + rgb/depth_bytes` 可以精确定位分块文件中的 RGBD 帧。
 
 ## 推荐启动顺序
 
-1. 三台 NanoPi 执行 `nanopi/start_tmux.sh`，确认相机 READY、UART shared memory 已连接。
+1. 三台 NanoPi 执行 `nanopi/start_tmux.sh`，或安装 `nanopi/autostart/` 中的 systemd 服务；确认相机 READY、UART shared memory 已连接。
 2. 启动三个 wearable ESP32。
 3. 启动 coordinator ESP32，确认 node 1、2、3 均 `connected=1`、`state=IDLE`。
 4. 启动 Windows `BLE-TimeSync`，等待 `TIME_ACCEPT ... nodes=3` 和 `[READY]`。

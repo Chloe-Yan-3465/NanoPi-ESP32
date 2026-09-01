@@ -10,6 +10,7 @@ find_package(realsense2 REQUIRED)
 find_package(yaml-cpp REQUIRED)
 find_package(PkgConfig REQUIRED)
 pkg_check_modules(ROCKCHIP_MPP REQUIRED IMPORTED_TARGET rockchip_mpp)
+pkg_check_modules(ZSTD REQUIRED IMPORTED_TARGET libzstd)
 
 add_executable(mode2_capture camera_cap/mode2_capture.cpp)
 target_compile_options(mode2_capture PRIVATE
@@ -29,13 +30,24 @@ else()
     target_include_directories(mode2_capture PRIVATE ${realsense2_INCLUDE_DIR})
 endif()
 
+# librealsense2 happens to re-export bundled ZSTD_* symbols, which lets the
+# linker drop libzstd under --as-needed and leaves the depth codec silently
+# bound to realsense's private copy. Pin the system libzstd with
+# --no-as-needed so its DT_NEEDED entry is always emitted. The raw
+# pkg-config path is used instead of PkgConfig::ZSTD because CMake hoists
+# imported-target libraries past the flat linker flags, which would separate
+# the flag from the library it must apply to.
 target_link_libraries(mode2_capture PRIVATE
     ${REALSENSE_TARGET}
     yaml-cpp
     PkgConfig::ROCKCHIP_MPP
+    -Wl,--no-as-needed
+    ${ZSTD_LINK_LIBRARIES}
+    -Wl,--as-needed
     Threads::Threads
     rt
 )
+target_include_directories(mode2_capture PRIVATE ${ZSTD_INCLUDE_DIRS})
 
 add_executable(uart_camera_receiver camera_cap/uart_camera_receiver.cpp)
 target_compile_options(uart_camera_receiver PRIVATE

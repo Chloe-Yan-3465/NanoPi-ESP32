@@ -25,7 +25,7 @@ Mode2Node-1 / Mode2Node-2 / Mode2Node-3
 NanoPi uart_camera_receiver
 ```
 
-Mode 2 的相机触发协议、BLE UUID、60字节 `WireMessage` 布局、START/STOP状态机均保持不变。授时只新增 `MessageType::time_sync = 8`。
+Mode 2 的相机触发协议、BLE UUID、60字节 `WireMessage` 布局、START/STOP状态机均保持不变。授时使用 `MessageType::time_sync = 8`，采集目录元数据使用 `task_name = 9` 与 `complex_level = 10`。
 
 ## 2. Windows到中控ESP32
 
@@ -145,12 +145,22 @@ Status : 5d6f0003-4f3c-4f59-a9f2-36f36a7c1000 (READ/NOTIFY)
 
 中控使用已有 `coordinatorToLocal()` 把一个共同的中控未来时刻转换到三个slave的本地单调时钟。
 
+START 前 Windows 发送：
+
+```text
+START TASK=<task_name> LEVEL=<complex_level>\n
+```
+
+两个字段只允许 `A-Z`、`a-z`、`0-9`、`_`、`-`。Coordinator 在 `plan`
+之前分别发送 `task_name` 与 `complex_level` 消息，字符串放在原 60 字节
+`WireMessage` 的 `a..d` 载荷区域，并与内部 session 绑定。
+
 ## 4. slave到NanoPi的UART协议
 
 ### 4.1 原有控制帧：完全不变
 
 ```text
-CMD+START+SESSION=<id>+END\r\n
+CMD+START+SESSION=<id>+TASK=<task_name>+LEVEL=<complex_level>+END\r\n
 CMD+STOP+SESSION=<id>+END\r\n
 ```
 

@@ -30,8 +30,11 @@ camera_controls:
 storage:
   base_dir: "/home/pi/data_mode2"
   # Keep the Depth stream active for Mode 2 synchronization; false only skips
-  # creating and writing depth_*.z16 files.
+  # creating and writing depth_*.rvz files.
   write_depth: true
+  # Depth on-disk codec: RVL + zstd level 1, lossless, ~9.4x
+  # smaller than raw Z16, ~16.7 ms/frame on RK3528A.
+  depth_codec: "rvl_zstd1"
   queue_capacity: 24
   chunk_frames: 300
   fdatasync_on_chunk_close: true

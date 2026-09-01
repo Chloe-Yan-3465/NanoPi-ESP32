@@ -19,6 +19,7 @@
 #include <array>
 #include <atomic>
 #include <cerrno>
+#include <cctype>
 #include <cmath>
 #include <cstddef>
 #include <cstdint>
@@ -59,6 +60,10 @@ constexpr std::int64_t kMinimumTimePlanMarginUs = 100000;
 constexpr std::int64_t kNanoPiUartApplyCompensationUs = 4500;
 constexpr double kFramePeriodUs = 1000000.0 / 30.0;
 constexpr std::uint32_t kPulseWidthUs = 100;
+constexpr std::size_t kTaskNameCapacity = 32;
+constexpr std::size_t kComplexLevelCapacity = 16;
+constexpr char kDefaultTaskName[] = "test";
+constexpr char kDefaultComplexLevel[] = "L_test";
 constexpr gpio_num_t kStatusLedGpio = GPIO_NUM_18;
 constexpr rmt_channel_t kStatusLedRmtChannel = RMT_CHANNEL_1;
 constexpr std::uint8_t kStatusLedClockDivider = 8;  // 80 MHz APB -> 0.1 us ticks
@@ -81,6 +86,8 @@ enum class MessageType : std::uint8_t {
     abort_session = 6,
     status = 7,
     time_sync = 8,
+    task_name = 9,
+    complex_level = 10,
 };
 
 enum class NodeState : std::uint32_t {
@@ -189,6 +196,78 @@ std::uint32_t parseSession(const String& line, std::uint32_t fallback)
         return fallback;
     const unsigned long value = line.substring(separator + 1).toInt();
     return value == 0 ? fallback : static_cast<std::uint32_t>(value);
+}
+
+bool validPathSegment(const String& value, std::size_t capacity)
+{
+    if (value.length() == 0 || value.length() >= capacity)
+        return false;
+    for (std::size_t i = 0; i < value.length(); ++i) {
+        const char ch = value[static_cast<unsigned int>(i)];
+        if (!(std::isalnum(static_cast<unsigned char>(ch)) ||
+              ch == '_' || ch == '-')) {
+            return false;
+        }
+    }
+    return true;
+}
+
+bool parseStartMetadata(const String& command, String& task_name,
+                        String& complex_level)
+{
+    task_name = kDefaultTaskName;
+    complex_level = kDefaultComplexLevel;
+    if (command.equalsIgnoreCase("START"))
+        return true;
+    if (command.startsWith("START ")) {
+        const String legacy_session = command.substring(6);
+        bool digits_only = legacy_session.length() > 0;
+        for (std::size_t i = 0; i < legacy_session.length(); ++i) {
+            if (!std::isdigit(static_cast<unsigned char>(
+                    legacy_session[static_cast<unsigned int>(i)]))) {
+                digits_only = false;
+                break;
+            }
+        }
+        if (digits_only)
+            return true;
+    }
+
+    constexpr char kTaskPrefix[] = "START TASK=";
+    constexpr char kLevelMarker[] = " LEVEL=";
+    if (!command.startsWith(kTaskPrefix))
+        return false;
+    const int level_marker = command.indexOf(kLevelMarker);
+    if (level_marker < 0)
+        return false;
+    task_name = command.substring(std::strlen(kTaskPrefix), level_marker);
+    complex_level = command.substring(
+        level_marker + static_cast<int>(std::strlen(kLevelMarker)));
+    return validPathSegment(task_name, kTaskNameCapacity) &&
+           validPathSegment(complex_level, kComplexLevelCapacity);
+}
+
+void setMetadataPayload(WireMessage& message, const char* value,
+                        std::size_t capacity)
+{
+    char* payload = reinterpret_cast<char*>(&message.a);
+    std::memset(payload, 0, sizeof(message.a) * 4);
+    std::snprintf(payload, std::min(capacity, sizeof(message.a) * 4), "%s",
+                  value);
+}
+
+bool readMetadataPayload(const WireMessage& message, char* output,
+                         std::size_t capacity)
+{
+    const char* payload = reinterpret_cast<const char*>(&message.a);
+    const std::size_t length = strnlen(payload, sizeof(message.a) * 4);
+    if (length == 0 || length >= capacity ||
+        length == sizeof(message.a) * 4) {
+        return false;
+    }
+    std::memcpy(output, payload, length);
+    output[length] = '\0';
+    return validPathSegment(String(output), capacity);
 }
 
 bool gStatusLedReady = false;
@@ -339,6 +418,10 @@ std::size_t gRmtItemsUsed = 0;
 std::int64_t gRunStartUs = 0;
 std::int64_t gNeoDeadlineUs = 0;
 String gNeoLine;
+char gTaskName[kTaskNameCapacity] = "test";
+char gComplexLevel[kComplexLevelCapacity] = "L_test";
+std::uint32_t gTaskMetadataSession = 0;
+std::uint32_t gLevelMetadataSession = 0;
 
 void notifyNode(const WireMessage& source)
 {
@@ -415,14 +498,21 @@ bool parseUnsignedField(const String& line, const char* field,
     return true;
 }
 
-bool enqueueNeoControl(const char* verb, std::uint32_t session_id)
+bool enqueueNeoControl(const char* verb, std::uint32_t session_id,
+                       const char* task_name = nullptr,
+                       const char* complex_level = nullptr)
 {
     NeoTxMessage message{};
     message.kind = NeoTxKind::text;
-    const int length = std::snprintf(
-        message.text, sizeof(message.text),
-        "CMD+%s+SESSION=%lu+END\r\n", verb,
-        static_cast<unsigned long>(session_id));
+    const int length = task_name != nullptr && complex_level != nullptr
+        ? std::snprintf(
+              message.text, sizeof(message.text),
+              "CMD+%s+SESSION=%lu+TASK=%s+LEVEL=%s+END\r\n", verb,
+              static_cast<unsigned long>(session_id), task_name, complex_level)
+        : std::snprintf(
+              message.text, sizeof(message.text),
+              "CMD+%s+SESSION=%lu+END\r\n", verb,
+              static_cast<unsigned long>(session_id));
     if (length <= 0 || static_cast<std::size_t>(length) >= sizeof(message.text) ||
         gNeoControlTxQueue == nullptr ||
         xQueueSend(gNeoControlTxQueue, &message, 0) != pdTRUE) {
@@ -826,6 +916,28 @@ void processNodeCommand(const WireMessage& message)
 {
     const MessageType type = static_cast<MessageType>(message.type);
 
+    if (type == MessageType::task_name) {
+        char value[kTaskNameCapacity]{};
+        if (!readMetadataPayload(message, value, sizeof(value))) {
+            gErrorFlags.fetch_or(error_bad_packet);
+            return;
+        }
+        std::snprintf(gTaskName, sizeof(gTaskName), "%s", value);
+        gTaskMetadataSession = message.session_id;
+        return;
+    }
+
+    if (type == MessageType::complex_level) {
+        char value[kComplexLevelCapacity]{};
+        if (!readMetadataPayload(message, value, sizeof(value))) {
+            gErrorFlags.fetch_or(error_bad_packet);
+            return;
+        }
+        std::snprintf(gComplexLevel, sizeof(gComplexLevel), "%s", value);
+        gLevelMetadataSession = message.session_id;
+        return;
+    }
+
     if (type == MessageType::plan) {
         const NodeState state = gNodeState.load();
         if (state != NodeState::idle && state != NodeState::fault) {
@@ -843,7 +955,9 @@ void processNodeCommand(const WireMessage& message)
 
         const double period_us =
             static_cast<double>(plan.local_period_q32_us) / 4294967296.0;
-        if (plan.local_epoch_us - esp_timer_get_time() < kMinimumArmMarginUs ||
+        if (gTaskMetadataSession != plan.session_id ||
+            gLevelMetadataSession != plan.session_id ||
+            plan.local_epoch_us - esp_timer_get_time() < kMinimumArmMarginUs ||
             period_us < 30000.0 || period_us > 37000.0 ||
             !buildRmtPattern(plan)) {
             gErrorFlags.fetch_or(error_bad_plan);
@@ -862,7 +976,8 @@ void processNodeCommand(const WireMessage& message)
         gRunStartUs = 0;
         gGeneratedPulses.store(0);
         gNodeState.store(NodeState::waiting_neo_start);
-        if (!enqueueNeoControl("START", plan.session_id)) {
+        if (!enqueueNeoControl("START", plan.session_id,
+                               gTaskName, gComplexLevel)) {
             gNodeState.store(NodeState::fault);
             sendStatus();
             return;
@@ -1758,7 +1873,8 @@ bool parsePreciseTimeSetCommand(const String& command,
     return true;
 }
 
-bool beginSession(std::uint32_t session_id)
+bool beginSession(std::uint32_t session_id, const String& task_name,
+                  const String& complex_level)
 {
     const std::int64_t now_us = esp_timer_get_time();
     std::size_t connected_nodes = 0;
@@ -1788,6 +1904,22 @@ bool beginSession(std::uint32_t session_id)
     for (auto& link : gLinks) {
         if (!link.connected)
             continue;
+        WireMessage task{};
+        task.type = static_cast<std::uint8_t>(MessageType::task_name);
+        task.sequence = ++gSequence;
+        task.session_id = session_id;
+        setMetadataPayload(task, task_name.c_str(), kTaskNameCapacity);
+        if (!sendMessage(link, task, true))
+            return false;
+
+        WireMessage level{};
+        level.type = static_cast<std::uint8_t>(MessageType::complex_level);
+        level.sequence = ++gSequence;
+        level.session_id = session_id;
+        setMetadataPayload(level, complex_level.c_str(), kComplexLevelCapacity);
+        if (!sendMessage(link, level, true))
+            return false;
+
         WireMessage plan{};
         plan.type = static_cast<std::uint8_t>(MessageType::plan);
         plan.sequence = ++gSequence;
@@ -1806,8 +1938,9 @@ bool beginSession(std::uint32_t session_id)
     gPendingCoordinatorEpochUs = epoch_us;
     gLedParticipantMask.store(participant_mask);
     gLedSessionActive.store(true);
-    Serial.printf("session %lu planned; common epoch=%lldus, waiting for %u Neo ACK(s)\n",
+    Serial.printf("session %lu task=%s level=%s planned; common epoch=%lldus, waiting for %u Neo ACK(s)\n",
                   static_cast<unsigned long>(session_id),
+                  task_name.c_str(), complex_level.c_str(),
                   static_cast<long long>(epoch_us),
                   static_cast<unsigned>(connected_nodes));
     return true;
@@ -1978,7 +2111,15 @@ void processCoordinatorCommand(const String& command)
     } else if (command.startsWith("START")) {
         const std::uint32_t fallback =
             static_cast<std::uint32_t>(esp_timer_get_time() / 1000);
-        beginSession(parseSession(command, fallback == 0 ? 1 : fallback));
+        String task_name;
+        String complex_level;
+        if (!parseStartMetadata(command, task_name, complex_level)) {
+            Serial.println(
+                "START rejected: usage START TASK=<task_name> LEVEL=<complex_level>");
+            return;
+        }
+        beginSession(parseSession(command, fallback == 0 ? 1 : fallback),
+                     task_name, complex_level);
     } else if (command.equalsIgnoreCase("STOP")) {
         stopSession();
     } else if (command.equalsIgnoreCase("ABORT")) {
@@ -1987,7 +2128,7 @@ void processCoordinatorCommand(const String& command)
         printCoordinatorStatus();
     } else if (command.length() > 0) {
         Serial.println(
-            "commands: SCAN, START <session>, STOP, ABORT, STATUS, "
+            "commands: SCAN, START TASK=<name> LEVEL=<level>, STOP, ABORT, STATUS, "
             "TIME <unix_sec> <usec>, TIME_QUERY <seq>, "
             "TIME_SET <seq> <coordinator_ref_us> <utc_ref_ns> <uncertainty_us>");
     }
@@ -2016,7 +2157,7 @@ void setup()
     Serial.printf("Mode2+Time coordinator ready; SCAN discovers nodes 1..%u on demand\n",
                   static_cast<unsigned>(kNodeCount));
     Serial.println(
-        "commands: SCAN, START <session>, STOP, ABORT, STATUS, "
+        "commands: SCAN, START TASK=<name> LEVEL=<level>, STOP, ABORT, STATUS, "
         "TIME <unix_sec> <usec>, TIME_QUERY <seq>, TIME_SET ...");
 }
 

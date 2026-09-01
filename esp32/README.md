@@ -151,9 +151,13 @@ wearable→NanoPi：
 
 ```text
 TIMESYNC+YYYY-MM-DDTHH:MM:SS.ffffffZ+END\r\n
-CMD+START+SESSION=<internal>+END\r\n
+CMD+START+SESSION=<internal>+TASK=<task_name>+LEVEL=<complex_level>+END\r\n
 CMD+STOP+SESSION=<internal>+END\r\n
 ```
+
+Windows UI 使用 `START TASK=<task_name> LEVEL=<complex_level>`。Coordinator
+通过 BLE 元数据消息把两个目录片段发给 wearable；裸 `START` 仍兼容并使用
+`test/L_test`。
 
 NanoPi→wearable：
 

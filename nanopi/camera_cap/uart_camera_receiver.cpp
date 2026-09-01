@@ -1,3 +1,4 @@
+#include <algorithm>
 #include <atomic>
 #include <cerrno>
 #include <chrono>
@@ -329,6 +330,8 @@ struct ParsedCommand
 {
     ParsedCommandType type = ParsedCommandType::NONE;
     std::uint32_t session = 0;
+    std::string task_name = "test";
+    std::string complex_level = "L_test";
 };
 
 static bool parse_uint32_exact(const std::string& text, std::uint32_t& value)
@@ -381,15 +384,58 @@ static bool parse_command_line(const std::string& raw_line,
         if (line.rfind(prefix_text, 0) != 0)
             continue;
 
-        std::string session_text = line.substr(
+        const std::string payload = line.substr(
             prefix_text.size(),
             line.size() - prefix_text.size() - suffix.size());
+        const size_t session_end = payload.find('+');
+        const std::string session_text = payload.substr(0, session_end);
         std::uint32_t session = 0;
         if (!parse_uint32_exact(session_text, session))
             return false;
 
+        std::string task_name = "test";
+        std::string complex_level = "L_test";
+        if (prefix.type == ParsedCommandType::START &&
+            session_end != std::string::npos)
+        {
+            const std::string metadata = payload.substr(session_end);
+            const std::string task_prefix = "+TASK=";
+            const std::string level_marker = "+LEVEL=";
+            if (metadata.rfind(task_prefix, 0) != 0)
+                return false;
+            const size_t level_start = metadata.find(level_marker,
+                                                      task_prefix.size());
+            if (level_start == std::string::npos)
+                return false;
+            task_name = metadata.substr(
+                task_prefix.size(), level_start - task_prefix.size());
+            complex_level = metadata.substr(level_start + level_marker.size());
+            const auto valid_segment = [](const std::string& value,
+                                          size_t capacity)
+            {
+                if (value.empty() || value.size() >= capacity)
+                    return false;
+                return std::all_of(value.begin(), value.end(), [](char ch)
+                {
+                    const unsigned char byte = static_cast<unsigned char>(ch);
+                    return std::isalnum(byte) || ch == '_' || ch == '-';
+                });
+            };
+            if (!valid_segment(task_name, CAMERA_TASK_NAME_CAPACITY) ||
+                !valid_segment(complex_level, CAMERA_COMPLEX_LEVEL_CAPACITY))
+            {
+                return false;
+            }
+        }
+        else if (session_end != std::string::npos)
+        {
+            return false;
+        }
+
         command.type = prefix.type;
         command.session = session;
+        command.task_name = task_name;
+        command.complex_level = complex_level;
         return true;
     }
     return false;
@@ -518,6 +564,16 @@ static void submit_camera_command(int serial_fd,
     camera_shm_store_u32(&shared.memory->command,
                          to_shared_command(command.type));
     camera_shm_store_u32(&shared.memory->session_id, command.session);
+    std::memset(shared.memory->task_name, 0,
+                sizeof(shared.memory->task_name));
+    std::memset(shared.memory->complex_level, 0,
+                sizeof(shared.memory->complex_level));
+    std::snprintf(shared.memory->task_name,
+                  sizeof(shared.memory->task_name), "%s",
+                  command.task_name.c_str());
+    std::snprintf(shared.memory->complex_level,
+                  sizeof(shared.memory->complex_level), "%s",
+                  command.complex_level.c_str());
     camera_shm_store_u32(&shared.memory->request_seq, sequence);
 
     pending.active = true;
@@ -630,7 +686,7 @@ static void usage(const char* program)
         << "  idle: set CLOCK_REALTIME only while camera is not recording (default)\n\n"
         << "Accepted UART frames:\n"
         << "  TIMESYNC+YYYY-MM-DDTHH:MM:SS.ffffffZ+END\\r\\n\n"
-        << "  CMD+START+SESSION=<id>+END\\r\\n\n"
+        << "  CMD+START+SESSION=<id>+TASK=<name>+LEVEL=<level>+END\\r\\n\n"
         << "  CMD+STOP+SESSION=<id>+END\\r\\n\n"
         << "  CMD+STATUS+SESSION=<id>+END\\r\\n\n";
 }

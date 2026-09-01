@@ -8,15 +8,16 @@ StartLimitIntervalSec=0
 Type=simple
 User=pi
 Group=pi
-WorkingDirectory=/home/pi
+WorkingDirectory=/home/pi/nanopi
 Environment=HOME=/home/pi
 Environment=TIME_SET_MODE=idle
-ExecStart=/home/pi/start_tmux_autostart.sh
+ExecStartPre=+/usr/local/sbin/nanopi-recover-realsense
+ExecStart=/home/pi/nanopi/start_tmux_autostart.sh
 SuccessExitStatus=143
 Restart=on-failure
-RestartSec=15
-TimeoutStopSec=10
-KillMode=control-group
+RestartSec=20
+TimeoutStopSec=40
+KillMode=mixed
 CapabilityBoundingSet=CAP_SYS_TIME CAP_SYS_NICE
 AmbientCapabilities=CAP_SYS_TIME CAP_SYS_NICE
 NoNewPrivileges=true
